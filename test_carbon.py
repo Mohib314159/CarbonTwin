@@ -1,99 +1,116 @@
 """
-VALIDATION HARNESS - proves the method recovers planted ground truth.
+The audit verdict — where a number becomes a decision.
 
-Run: python -m scripts.validate
-Prints a confusion matrix (truth vs verdict), reversal detection, and the
-portfolio risk roll-up. Because the synthetic data hides a known truth in every
-field, a clean recovery here is real evidence the pipeline works.
+This is the differentiator. Most teams will show "NDVI went up". We return a
+verdict against the farmer's *claim*, on a calibrated five-state scale that a
+risk MD will recognise instantly:
+
+  VERIFIED      significant effect, real additionality            -> credit it
+  PARTIAL       significant & real, but BELOW what was claimed     -> credit real part
+  INCONCLUSIVE  a real-looking but weak signal, NOT statistically
+                separable from natural variation (or poor baseline
+                fit) -> don't credit, don't accuse: recommend a visit
+  REJECTED      a claim was made but the field is essentially flat
+                -> possible false claim, flag for audit
+  BASELINE      no claim, no significant change -> business-as-usual (donor)
+
+The crucial honesty: a weak genuine adopter must NEVER be branded a liar. Only a
+field with no detectable change is REJECTED. The "I don't know yet" state is a
+feature, not a hedge - it's exactly how you avoid false accusations.
+Thresholds are explicit and tunable. Defensibility > cleverness.
 """
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
-import pandas as pd
 
-from src.synth_data import generate
-from src.pipeline import run_audit
-from src.portfolio import summarize
-from src.actuary import price_report
+# decision thresholds
+P_SIGNIF = 0.05          # placebo p-value for "significant"
+EFFECT_MIN = 0.03        # min mean off-season NDVI uplift to call it meaningful
+PRE_RMSE_MAX = 0.06      # if the pre-treatment fit is worse than this, don't trust it
 
-EXPECTED = {
-    "adopter":      "VERIFIED",
-    "over_claimer": "PARTIAL",
-    "weak":         {"INCONCLUSIVE", "PARTIAL", "VERIFIED"},
-    "reverter":     {"VERIFIED", "PARTIAL"},     # verified for the period it ran
-    "liar":         "REJECTED",
-    "control":      "BASELINE",
+COLORS = {
+    "VERIFIED": "#34a853",      # green
+    "PARTIAL": "#f9ab00",       # amber
+    "INCONCLUSIVE": "#a142f4",  # purple
+    "REJECTED": "#ea4335",      # red
+    "BASELINE": "#9aa0a6",      # grey
 }
 
 
-def main():
-    ds = generate(seed=7)
-    reports = [run_audit(ds, f.field_id) for f in ds.fields]
-    rows = []
-    for f, rep in zip(ds.fields, reports):
-        rows.append({
-            "field": f.field_id, "truth": f.truth_label, "claims": f.claims_adoption,
-            "verdict": rep.verdict.status,
-            "eff_os": round(rep.verdict.effect_offseason, 3),
-            "p": round(rep.inference.p_value, 3),
-            "tCO2e/yr": round(rep.carbon.central_tco2e_yr, 1),
-            "adopt_yr": (rep.detected_adoption_year if rep.detected_adoption_year else "-"),
-            "reversal": (f"{rep.reversal.reversal_year}" if rep.reversal.detected else "-"),
-        })
-    df = pd.DataFrame(rows).sort_values(["truth", "field"]).reset_index(drop=True)
-    pd.set_option("display.width", 150); pd.set_option("display.max_rows", 100)
-    print("\n=== PER-FIELD AUDIT (synthetic data, known ground truth) ===")
-    print(df.to_string(index=False))
-
-    claimed = df[df["claims"]].copy()
-    print("\n=== CONFUSION: claimed fields (truth -> verdict) ===")
-    print(pd.crosstab(claimed["truth"], claimed["verdict"]).to_string())
-
-    def ok(truth, verdict):
-        exp = EXPECTED[truth]
-        return verdict in exp if isinstance(exp, set) else verdict == exp
-    df["correct"] = df.apply(lambda r: ok(r["truth"], r["verdict"]), axis=1)
-    print("\n=== RECOVERY RATE BY TRUTH TYPE ===")
-    for k, v in df.groupby("truth")["correct"].mean().items():
-        print(f"  {k:12s}: {v*100:5.1f}%  ({int(df[df.truth==k].correct.sum())}/{(df.truth==k).sum()})")
-    fp = (df[df.truth == "control"].verdict == "VERIFIED").mean()
-    print(f"\n  control false-positive (VERIFIED) rate: {fp*100:.1f}%  (placebo null ~5% expected)")
-    print(f"  OVERALL recovery: {df['correct'].mean()*100:.1f}%")
-
-    # reversal recovery
-    rev_truth = df[df.truth == "reverter"]
-    rev_detected = (rev_truth.reversal != "-").mean() if len(rev_truth) else 0.0
-    print(f"\n=== PERMANENCE MONITORING ===")
-    print(f"  reverters with reversal correctly detected: {rev_detected*100:.0f}%  "
-          f"({(rev_truth.reversal != '-').sum()}/{len(rev_truth)})")
-    false_rev = df[(df.truth != 'reverter')]
-    fr = (false_rev.reversal != '-').sum()
-    print(f"  false reversal alerts on non-reverters: {fr}")
-
-    # portfolio + actuary
-    ps = summarize(reports, price=50.0)
-    print(f"\n=== PORTFOLIO RISK (price $50/tCO2e) ===")
-    print(f"  fields: {ps.n_fields}   verdicts: {ps.counts}")
-    print(f"  verified tonnage:        {ps.verified_tco2e:8.1f} tCO2e/yr")
-    print(f"  verified @ >=95% conf:   {ps.verified_at_95_tco2e:8.1f} tCO2e/yr")
-    print(f"  FRAUD exposure:          {ps.fraud_exposure_tco2e:8.1f} tCO2e/yr claimed-but-unverified "
-          f"= ${ps.fraud_exposure_value:,.0f}/yr across {ps.fraud_fields} fields")
-    print(f"  reversal at risk:        {ps.reversal_at_risk_tco2e:8.1f} tCO2e across {ps.reversal_fields} fields")
-    print(f"  observed reversal rate:  {ps.base_reversal_rate*100:.1f}%  "
-          f"(annual hazard {ps.base_annual_hazard*100:.1f}%/yr)")
-
-    print(f"\n=== ORBITAL ACTUARY (illustrative, sample fields) ===")
-    for f, rep in zip(ds.fields, reports):
-        rr = price_report(rep, ps.base_annual_hazard, price=50.0)
-        if rr.applicable:
-            print(f"  {f.field_id} ({f.truth_label:11s}): hazard {rr.annual_hazard*100:4.1f}%/yr  "
-                  f"10yr reversal {rr.reversal_prob_horizon*100:4.1f}%  "
-                  f"premium ${rr.annual_premium_per_tco2e:5.2f}/t  -> ${rr.annual_premium_value:,.0f}/yr")
-
-    df.to_csv("data/validation_results.csv", index=False)
-    print("\nsaved -> data/validation_results.csv")
+@dataclass
+class Verdict:
+    field_id: str
+    status: str
+    headline: str
+    effect_offseason: float
+    p_value: float
+    confidence: float
+    pre_rmse: float
+    reason: str
+    color: str
 
 
-if __name__ == "__main__":
-    main()
+def decide(field_id: str,
+           effect_full: np.ndarray,
+           post_mask: np.ndarray,
+           offseason_post_mask: np.ndarray,
+           p_value: float,
+           confidence: float,
+           pre_rmse: float,
+           claims_adoption: bool,
+           claimed_rate_tco2e_ha: Optional[float] = None,
+           est_rate_tco2e_ha: Optional[float] = None,
+           pre_rmse_max: float = PRE_RMSE_MAX,
+           coverage_ok: bool = True) -> Verdict:
+    eff_os = (float(np.mean(effect_full[offseason_post_mask]))
+              if offseason_post_mask.any() else float(np.mean(effect_full[post_mask])))
+
+    significant = (p_value < P_SIGNIF) and (eff_os > EFFECT_MIN)
+    has_signal = eff_os > EFFECT_MIN
+    bad_fit = pre_rmse > pre_rmse_max
+
+    def v(status, headline, reason):
+        return Verdict(field_id, status, headline, eff_os, p_value, confidence,
+                       pre_rmse, reason, COLORS[status])
+
+    # 0) not enough cloud-free observations in the signal window -> never guess.
+    # A clouded-out winter must not be flattened into a confident "no cover crop".
+    if not coverage_ok:
+        return v("INCONCLUSIVE", "Insufficient cloud-free observations",
+                 "Too few real (non-interpolated) off-season observations to judge "
+                 "this field. We decline to score rather than trust interpolated data.")
+
+    # 1) significant, real effect
+    if significant and not bad_fit:
+        if (claimed_rate_tco2e_ha is not None and est_rate_tco2e_ha is not None
+                and est_rate_tco2e_ha < 0.6 * claimed_rate_tco2e_ha):
+            return v("PARTIAL", "Real effect, but smaller than claimed",
+                     f"Significant uplift (p={p_value:.3f}) but verified rate "
+                     f"~{est_rate_tco2e_ha:.2f} vs claimed {claimed_rate_tco2e_ha:.2f} "
+                     f"tCO2e/ha/yr. Credit only the verified portion.")
+        return v("VERIFIED", "Additionality confirmed",
+                 f"Off-season NDVI is {eff_os:+.3f} above the synthetic twin, "
+                 f"sustained post-2021, p={p_value:.3f} ({confidence:.0f}% conf).")
+
+    # 2) a real-looking but not-significant signal, or weak baseline fit
+    if has_signal or bad_fit:
+        why = (f"baseline fit (RMSE {pre_rmse:.3f}) exceeds the dataset noise floor "
+               f"({pre_rmse_max:.3f})" if bad_fit
+               else "a weak uplift is visible but not statistically separable from "
+                    "natural variation at p<0.05")
+        return v("INCONCLUSIVE", "Insufficient evidence - recommend site visit",
+                 f"Effect {eff_os:+.3f}, p={p_value:.3f}: {why}. We neither credit "
+                 f"nor reject - this is the calibrated 'go look' state.")
+
+    # 3) flat. if they claimed something, that's a possible false claim
+    if claims_adoption:
+        return v("REJECTED", "Claim not supported - possible false claim",
+                 f"Field claims adoption but shows no detectable divergence "
+                 f"(effect {eff_os:+.3f}, p={p_value:.3f}). Flag for site visit.")
+
+    # 4) flat and no claim -> business as usual
+    return v("BASELINE", "Business-as-usual (no claim, no change)",
+             "No adoption claimed and no significant divergence - donor-eligible.")

@@ -1,155 +1,78 @@
 """
-Data contract — the single fixed internal format the whole pipeline speaks.
+Carbon estimate — honest, cited, uncertainty-first.
 
-The point of this file: everything downstream (synthetic control, inference,
-carbon, audit, dashboard) is built and tested against THIS schema. On hackathon
-day the only new code we write is a thin adapter (src/adapter.py) that reads
-Treefera's actual files and produces a `Dataset`. Nothing else changes.
+The weakest scientific link in any "NDVI -> carbon" story is the conversion, and
+a physicist judge will go straight for it. So we do NOT invent a precise
+"tCO2e per NDVI unit" coefficient. Instead:
 
-A `Dataset` is:
-  - dates:   1-D array of numpy datetime64[D], sorted ascending, length T
-  - fields:  list[FieldSeries], each with an NDVI vector aligned to `dates`
-             (NaN where no cloud-free observation exists)
+  1. The synthetic control decides WHETHER a real, significant additionality
+     effect exists (that's the defensible part).
+  2. If verified, we attach a per-hectare sequestration rate drawn from the
+     published literature, carried with a wide band.
+  3. The *magnitude* of the causal NDVI effect only places the field WITHIN that
+     band (stronger sustained greenness -> more biomass input -> upper end). The
+     absolute number stays uncertain and we say so.
 
-That's it. NDVI in [-1, 1]. One value per field per date. Field-level means
-we've already reduced each polygon to its mean NDVI; the dashboard works at
-field granularity, which keeps the story (and the maths) clean.
+Literature anchors (state these):
+  * Cover cropping sequesters ~0.22 t CARBON / acre / yr  (CO2e ~ x 3.67/0.405
+    ~ 2.0 tCO2e/ha/yr at the high end of estimates).
+  * No-till + cover cropping together ~1.2 tCO2e/ha/yr net mitigation.
+  * Soil-carbon studies more conservatively report ~0.2-0.5 tCO2e/ha/yr.
+  * Carbon price varies wildly (~$/EUR 5-100+/tCO2e by market).
+
+So the defensible central range we carry is ~0.2-2.0 tCO2e/ha/yr, central ~1.0.
+Note: per-field money is SMALL. That is precisely why
+automated verification (not manual audits) is the only way the market scales.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
-import numpy as np
-import pandas as pd
+# central estimate and band (tCO2e per hectare per year), literature-derived
+RATE_CENTRAL = 1.0
+RATE_LOW = 0.2
+RATE_HIGH = 2.0
 
-
-@dataclass
-class FieldSeries:
-    """One field: its NDVI time series plus the metadata the audit needs."""
-    field_id: str
-    ndvi: np.ndarray              # shape (T,), float, NaN allowed for cloud gaps
-    lat: float
-    lon: float
-    area_ha: float
-    # --- claim metadata (what the farmer says they did) ---
-    claims_adoption: bool = False         # did they claim a regen practice?
-    claimed_year: Optional[int] = None    # the year they claim they started
-    claimed_rate_tco2e_ha: Optional[float] = None  # optional: per-ha rate they assert
-    # --- ground truth (ONLY present in synthetic data, for validation) ---
-    truth_label: Optional[str] = None     # 'adopter' | 'liar' | 'exaggerator' | 'control'
-    truth_year: Optional[int] = None
-
-    def __post_init__(self) -> None:
-        self.ndvi = np.asarray(self.ndvi, dtype=float)
+# the NDVI off-season effect that we treat as a "strong" signal (places field
+# at the top of the band). Calibrated to the corn-belt cover-crop literature
+# signal, NOT a physical conversion — see module docstring.
+NDVI_EFFECT_REFERENCE = 0.20
 
 
 @dataclass
-class Dataset:
-    """A bundle of fields sharing one date axis."""
-    dates: np.ndarray                      # datetime64[D], shape (T,)
-    fields: list[FieldSeries] = field(default_factory=list)
+class CarbonEstimate:
+    central_tco2e_yr: float
+    low_tco2e_yr: float
+    high_tco2e_yr: float
+    rate_central: float        # per ha
+    note: str
 
-    def __post_init__(self) -> None:
-        self.dates = np.asarray(self.dates, dtype="datetime64[D]")
-        T = len(self.dates)
-        for f in self.fields:
-            if f.ndvi.shape[0] != T:
-                raise ValueError(
-                    f"Field {f.field_id} has {f.ndvi.shape[0]} points "
-                    f"but dataset has {T} dates. Adapter must align them."
-                )
-
-    # ---- convenience lookups -------------------------------------------------
-    def by_id(self, field_id: str) -> FieldSeries:
-        for f in self.fields:
-            if f.field_id == field_id:
-                return f
-        raise KeyError(field_id)
-
-    @property
-    def ids(self) -> list[str]:
-        return [f.field_id for f in self.fields]
-
-    def control_ids(self) -> list[str]:
-        """Donor pool = fields that make no adoption claim.
-
-        Honest assumption, stated in the pitch: a conventional 'business-as-
-        usual' donor is a field with no claimed practice change. On real data
-        you'd refine this (exclude any field showing its own off-season
-        greenness), but no-claim is the clean, defensible default.
-        """
-        return [f.field_id for f in self.fields if not f.claims_adoption]
+    def value_range_gbp(self, price_low: float = 5.0, price_high: float = 100.0
+                        ) -> tuple[float, float]:
+        return self.low_tco2e_yr * price_low, self.high_tco2e_yr * price_high
 
 
-# ---------------------------------------------------------------------------
-# Preprocessing: cloud gaps -> clean monthly grid.
-# This is the "median composite" step — standard MRV practice and the exact
-# answer to the judge question "how do you handle clouds?".
-# ---------------------------------------------------------------------------
-def monthly_composite(dataset: Dataset) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reduce cloudy ~biweekly series to monthly-median NDVI.
+def estimate_carbon(ndvi_effect: float, area_ha: float, verified: bool
+                    ) -> CarbonEstimate:
+    """Convert a *verified* NDVI additionality effect to an indicative CO2e/yr.
 
-    Returns
-    -------
-    month_dates : (M,) datetime64[D]   -- first-of-month axis
-    matrix      : (N_fields, M) float  -- monthly NDVI, interpolated for the solver
-    observed    : (N_fields, M) bool   -- True where the month had a REAL (cloud-free)
-                                          observation, i.e. NOT interpolated.
-
-    The solver needs a complete (no-NaN) vector, so we interpolate gaps. But we
-    DO NOT pretend the interpolated values are evidence: `observed` records which
-    months are real, and the pipeline refuses to score a field whose off-season
-    signal window is mostly interpolated (a clouded-out winter must never be
-    flattened into a confident "no cover crop"). See pipeline.offseason_coverage.
+    If not verified, returns zeros — we never credit an unproven claim.
     """
-    df_dates = pd.to_datetime(dataset.dates)
-    months = df_dates.to_period("M")
-    unique_months = pd.period_range(months.min(), months.max(), freq="M")
-    month_dates = np.array(
-        [p.to_timestamp().to_datetime64() for p in unique_months], dtype="datetime64[D]"
-    )
+    if not verified or ndvi_effect <= 0:
+        return CarbonEstimate(0.0, 0.0, 0.0, 0.0,
+                              "No verified additionality — no credit attributed.")
 
-    rows, obs = [], []
-    for f in dataset.fields:
-        s = pd.Series(f.ndvi, index=months)
-        monthly = s.groupby(level=0).median().reindex(unique_months)
-        obs.append(monthly.notna().to_numpy())          # real months, pre-fill
-        monthly = monthly.interpolate(method="linear", limit_direction="both")
-        rows.append(monthly.to_numpy())
+    # place within the band by signal strength, clamped to [0, 1].
+    # IMPORTANT: this is a *triage* scaling for dashboard ranking, NOT a physical
+    # NDVI->carbon conversion. The defensible claim is the statistical
+    # additionality + the literature band; the point estimate is indicative only.
+    strength = max(0.0, min(1.0, ndvi_effect / NDVI_EFFECT_REFERENCE))
+    rate = RATE_LOW + strength * (RATE_CENTRAL - RATE_LOW)  # conservative centre
 
-    matrix = np.vstack(rows)
-    observed = np.vstack(obs)
-    # any field that is still all-NaN (no data at all) -> zeros, flagged unobserved
-    matrix = np.nan_to_num(matrix, nan=0.0)
-    return month_dates, matrix, observed
-
-
-def offseason_mask(month_dates: np.ndarray, lat: float | None = None) -> np.ndarray:
-    """Boolean mask for the cover-crop signal window (post-harvest + spring).
-
-    Cover crops show up as *off-season* greenness — roughly Oct–Dec and Mar–Apr in
-    the Northern-Hemisphere corn belt. The summer cash crop dominates and is noisier
-    for additionality, so the audit weights the off-season.
-
-    If `lat` is given and negative (Southern Hemisphere), the window is shifted by
-    six months so the mask still tracks the off-season there (e.g. Brazil/Argentina),
-    rather than mistaking their summer harvest for a missing cover crop.
-    """
-    base = [10, 11, 12, 3, 4]
-    if lat is not None and lat < 0:
-        base = [((mo + 6 - 1) % 12) + 1 for mo in base]   # -> [4, 5, 6, 9, 10]
-    m = pd.to_datetime(month_dates).month
-    return np.isin(m, base)
-
-
-def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in metres (NaN if any coordinate is missing)."""
-    import numpy as _np
-    if any(_np.isnan(v) for v in (lat1, lon1, lat2, lon2)):
-        return float("nan")
-    R = 6_371_000.0
-    p1, p2 = _np.radians(lat1), _np.radians(lat2)
-    dphi, dl = _np.radians(lat2 - lat1), _np.radians(lon2 - lon1)
-    a = _np.sin(dphi / 2) ** 2 + _np.cos(p1) * _np.cos(p2) * _np.sin(dl / 2) ** 2
-    return float(2 * R * _np.arcsin(_np.sqrt(a)))
+    central = rate * area_ha
+    low = RATE_LOW * area_ha
+    high = RATE_HIGH * area_ha
+    note = ("Indicative triage estimate, NOT a measured tonnage. Statistical "
+            "significance is proven; the tonnage is a linear scaling bounded by the "
+            "literature band (0.2-2.0 tCO2e/ha/yr) and requires soil-core calibration.")
+    return CarbonEstimate(central, low, high, rate, note)

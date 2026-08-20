@@ -1,92 +1,100 @@
 """
-Synthetic Control Method (Abadie, Diamond & Hainmueller).
+The Orbital Actuary — pricing reversal risk for a carbon credit.
 
-The single treated field is reconstructed as a convex combination of donor
-("business-as-usual") fields, with weights chosen to match the treated field's
-PRE-treatment NDVI as closely as possible. The post-treatment gap between the
-real field and this synthetic twin is the causal additionality estimate.
+The honest bridge from orbital MRV to actuarial finance. We do NOT invent a
+precise per-farmer probability from radar we don't have. Instead:
 
-Why convex weights (w >= 0, sum = 1) and not free regression: it forbids
-extrapolation. The counterfactual is an interpolation of real fields, so it
-stays physically plausible and can't manufacture a fake baseline by
-over-fitting with large +/- coefficients. That restraint is the whole point.
+  hazard(field) = base_annual_hazard  x  stability_multiplier(field)
+
+  * base_annual_hazard comes from the OBSERVED reversal frequency across the
+    portfolio (a frequency estimate — exactly what an actuary starts from).
+  * stability_multiplier is a transparent score from THIS field's own
+    additionality trajectory: a declining or volatile credit is riskier.
+
+Survival is the standard exponential model S(t) = exp(-hazard * t) (Weibull is
+the natural generalisation if a shape parameter is later calibrated). From that
+we read a horizon reversal probability and an *illustrative* risk premium. Every
+number here is bounded and labelled indicative — the novelty is the bridge, not
+a claim of actuarial precision from one short series.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.optimize import minimize
 
 
 @dataclass
-class SCMResult:
-    weights: np.ndarray        # (m,) donor weights, >=0 sum 1
-    synthetic: np.ndarray      # (T,) synthetic twin over the FULL period
-    effect: np.ndarray         # (T,) target - synthetic  (+ = additionality)
-    pre_rmse: float            # fit quality before treatment (lower = better)
-    donor_ids: list[str]
+class ReversalRisk:
+    applicable: bool              # only meaningful for credits with verified carbon
+    stability_multiplier: float
+    annual_hazard: float
+    survival_curve: list[float]   # S(t) for t = 0..horizon
+    horizon_years: int
+    reversal_prob_horizon: float  # 1 - S(horizon)
+    annual_premium_per_tco2e: float
+    insured_tco2e: float          # the tonnage being insured (per yr)
+    annual_premium_value: float   # premium_per_ton x insured tonnage
+    note: str
 
 
-def solve_weights(y_pre: np.ndarray, X_pre: np.ndarray) -> np.ndarray:
-    """Find convex weights w minimising ||y_pre - X_pre @ w||^2.
+def _stability_multiplier(yearly_effect: list[float]) -> float:
+    """Higher when a credit's additionality is declining or volatile.
 
-    y_pre : (Tpre,)         target pre-treatment NDVI
-    X_pre : (Tpre, m)       donor pre-treatment NDVI (columns = donors)
-
-    Robust by design: SLSQP can fail to converge on highly collinear donors
-    (neighbouring fields often are). If it reports failure or returns anything
-    non-finite, we fall back to a transparent equal-weight average rather than
-    silently feeding garbage into a verification tool.
+    Transparent triage score in roughly [0.5, 2.5]; not a calibrated parameter.
     """
-    m = X_pre.shape[1]
-    w_equal = np.full(m, 1.0 / m)
-    if not np.all(np.isfinite(y_pre)) or not np.all(np.isfinite(X_pre)):
-        # caller should sanitise, but never let NaNs reach the optimiser
-        return w_equal
-
-    def loss(w: np.ndarray) -> float:
-        r = y_pre - X_pre @ w
-        return float(r @ r)
-
-    def grad(w: np.ndarray) -> np.ndarray:
-        return -2.0 * X_pre.T @ (y_pre - X_pre @ w)
-
-    cons = ({"type": "eq", "fun": lambda w: np.sum(w) - 1.0,
-             "jac": lambda w: np.ones_like(w)},)
-    bounds = [(0.0, 1.0)] * m
-
-    res = minimize(loss, w_equal, jac=grad, method="SLSQP", bounds=bounds,
-                   constraints=cons, options={"maxiter": 500, "ftol": 1e-12})
-
-    w = np.clip(res.x, 0.0, None) if res.x is not None else w_equal
-    s = w.sum()
-    w = w / s if s > 0 else w_equal
-    # accept only a finite solution that beats the equal-weight baseline; else fall back
-    if (not res.success) or (not np.all(np.isfinite(w))) or loss(w) > loss(w_equal) + 1e-9:
-        return w_equal
-    return w
+    y = np.asarray([e for e in yearly_effect], dtype=float)
+    if y.size < 2:
+        return 1.0
+    peak = max(float(np.max(y)), 1e-6)
+    last = float(y[-1])
+    decline_frac = float(np.clip((peak - last) / peak, 0.0, 1.0))
+    vol = float(np.clip(np.std(y) / peak, 0.0, 1.0))
+    m = 0.6 + 1.6 * decline_frac + 0.6 * vol
+    return float(np.clip(m, 0.5, 2.5))
 
 
-def fit(target_ndvi: np.ndarray,
-        donor_matrix: np.ndarray,
-        pre_mask: np.ndarray,
-        donor_ids: list[str]) -> SCMResult:
-    """Fit a synthetic control.
+def price_report(report, base_annual_hazard: float, price: float = 50.0,
+                 horizon_years: int = 10) -> ReversalRisk:
+    """Price the reversal risk of one audited field."""
+    insured = float(getattr(report.carbon, "central_tco2e_yr", 0.0) or 0.0)
+    verified = report.verdict.status in ("VERIFIED", "PARTIAL")
 
-    target_ndvi  : (T,)        treated field, full period (no NaNs — composite first)
-    donor_matrix : (m, T)      donor fields, full period
-    pre_mask     : (T,) bool   True for pre-treatment dates
-    """
-    y_pre = target_ndvi[pre_mask]
-    X_pre = donor_matrix[:, pre_mask].T          # (Tpre, m)
+    rev = getattr(report, "reversal", None)
+    yearly = rev.yearly_effect if rev is not None else []
+    mult = _stability_multiplier(yearly)
 
-    w = solve_weights(y_pre, X_pre)
-    synthetic = donor_matrix.T @ w               # (T,)
-    effect = target_ndvi - synthetic             # + means target greener than twin
+    # a reverted credit is effectively certain to have failed; floor the base
+    # hazard so a portfolio with zero observed reversals still prices *some* risk.
+    base = max(base_annual_hazard, 0.01)
+    hazard = float(np.clip(base * mult, 0.0, 0.6))
+    if rev is not None and rev.detected:
+        hazard = max(hazard, 0.25)   # already reversing -> high hazard
 
-    resid_pre = y_pre - X_pre @ w
-    pre_rmse = float(np.sqrt(np.mean(resid_pre ** 2)))
+    t = np.arange(0, horizon_years + 1)
+    if rev is not None and rev.detected:
+        # Confirmed reversal: the credit is impaired NOW, not a future maybe.
+        # Model it as (near-)terminated rather than smooth exponential survival
+        # (which would absurdly imply an already-collapsed asset still survives).
+        survival = np.where(t == 0, 1.0, 0.05)
+        reversal_note = (" Reversal already detected: credit treated as impaired "
+                         "(survival ~0), not a forward projection.")
+    else:
+        survival = np.exp(-hazard * t)
+        reversal_note = ""
+    prob_h = float(1.0 - survival[-1])
 
-    return SCMResult(weights=w, synthetic=synthetic, effect=effect,
-                     pre_rmse=pre_rmse, donor_ids=donor_ids)
+    # illustrative annual premium per tonne = price x expected annual loss rate
+    prem_per_ton = float(price * hazard)
+    prem_value = prem_per_ton * insured
+
+    if not verified or insured <= 0:
+        return ReversalRisk(False, mult, hazard, survival.tolist(), horizon_years,
+                            prob_h, 0.0, 0.0, 0.0,
+                            "No verified carbon to insure.")
+
+    note = ("Illustrative. Hazard = portfolio base rate x trajectory-stability "
+            "score; premium = price x annual hazard. Calibrate on real reversal "
+            "history before quoting." + reversal_note)
+    return ReversalRisk(True, mult, hazard, survival.tolist(), horizon_years,
+                        prob_h, prem_per_ton, insured, prem_value, note)

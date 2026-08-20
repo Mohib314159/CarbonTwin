@@ -1,53 +1,42 @@
-"""Verdict logic — every state, including the honest INCONCLUSIVE."""
+"""SCM solver correctness."""
 import numpy as np
-from src.audit import decide
+from src.scm import solve_weights, fit
 
-# helper: build masks/effect for a post-only off-season effect value
-def _mk(effect_value, pre_rmse=0.02):
+
+def test_weights_are_convex():
+    rng = np.random.default_rng(0)
+    X = rng.random((20, 5))
+    y = rng.random(20)
+    w = solve_weights(y, X)
+    assert np.all(w >= -1e-9)
+    assert abs(w.sum() - 1.0) < 1e-6
+
+
+def test_recovers_identical_donor():
+    # target pre exactly equals donor 0 -> weight should concentrate on donor 0
+    rng = np.random.default_rng(1)
+    d0 = rng.random(30)
+    X = np.column_stack([d0, rng.random(30), rng.random(30)])
+    w = solve_weights(d0.copy(), X)
+    assert w[0] > 0.95
+
+
+def test_recovers_known_linear_combo():
+    rng = np.random.default_rng(2)
+    d0, d1 = rng.random(40), rng.random(40)
+    target = 0.6 * d0 + 0.4 * d1
+    X = np.column_stack([d0, d1])
+    w = solve_weights(target, X)
+    assert abs(w[0] - 0.6) < 0.03 and abs(w[1] - 0.4) < 0.03
+
+
+def test_fit_effect_sign_is_target_minus_synthetic():
+    # target sits ABOVE donors post-treatment -> effect must be positive
     T = 24
-    post = np.zeros(T, bool); post[12:] = True
-    os_post = np.zeros(T, bool); os_post[12:] = True
-    eff = np.zeros(T); eff[os_post] = effect_value
-    return eff, post, os_post, pre_rmse
-
-
-def test_flat_claim_is_rejected():
-    eff, post, osp, r = _mk(0.0)
-    v = decide("F", eff, post, osp, p_value=0.6, confidence=40, pre_rmse=r,
-               claims_adoption=True)
-    assert v.status == "REJECTED"
-
-
-def test_strong_significant_is_verified():
-    eff, post, osp, r = _mk(0.15)
-    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=r,
-               claims_adoption=True)
-    assert v.status == "VERIFIED"
-
-
-def test_significant_below_claim_is_partial():
-    eff, post, osp, r = _mk(0.10)
-    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=r,
-               claims_adoption=True, claimed_rate_tco2e_ha=3.0, est_rate_tco2e_ha=0.5)
-    assert v.status == "PARTIAL"
-
-
-def test_signal_but_not_significant_is_inconclusive():
-    eff, post, osp, r = _mk(0.06)
-    v = decide("F", eff, post, osp, p_value=0.12, confidence=88, pre_rmse=r,
-               claims_adoption=True)
-    assert v.status == "INCONCLUSIVE"
-
-
-def test_bad_prefit_is_inconclusive():
-    eff, post, osp, _ = _mk(0.15, pre_rmse=0.09)
-    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=0.09,
-               claims_adoption=True)
-    assert v.status == "INCONCLUSIVE"
-
-
-def test_flat_no_claim_is_baseline():
-    eff, post, osp, r = _mk(0.0)
-    v = decide("F", eff, post, osp, p_value=0.6, confidence=40, pre_rmse=r,
-               claims_adoption=False)
-    assert v.status == "BASELINE"
+    pre = np.arange(T) < 12
+    donors = np.vstack([np.full(T, 0.3), np.full(T, 0.3)])
+    target = np.full(T, 0.3)
+    target[~pre] = 0.5  # jump up after treatment
+    res = fit(target, donors, pre, ["a", "b"])
+    assert res.effect[~pre].mean() > 0.15
+    assert res.pre_rmse < 1e-6

@@ -1,100 +1,94 @@
 """
-The Orbital Actuary — pricing reversal risk for a carbon credit.
+Portfolio risk layer — the risk-desk view across all audited fields.
 
-The honest bridge from orbital MRV to actuarial finance. We do NOT invent a
-precise per-farmer probability from radar we don't have. Instead:
-
-  hazard(field) = base_annual_hazard  x  stability_multiplier(field)
-
-  * base_annual_hazard comes from the OBSERVED reversal frequency across the
-    portfolio (a frequency estimate — exactly what an actuary starts from).
-  * stability_multiplier is a transparent score from THIS field's own
-    additionality trajectory: a declining or volatile credit is riskier.
-
-Survival is the standard exponential model S(t) = exp(-hazard * t) (Weibull is
-the natural generalisation if a shape parameter is later calibrated). From that
-we read a horizon reversal probability and an *illustrative* risk premium. Every
-number here is bounded and labelled indicative — the novelty is the bridge, not
-a claim of actuarial precision from one short series.
+Deliberately simple and defensive: it only sums/counts scalars that the audit
+already produced, and guards every value so one bad field can never blank the
+whole summary. This is what turns "we detect cover crops" into "we quantify the
+verified tonnage, the fraud exposure, and the reversal risk of a credit book".
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
+
+
+def _safe(x: float) -> float:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass
-class ReversalRisk:
-    applicable: bool              # only meaningful for credits with verified carbon
-    stability_multiplier: float
-    annual_hazard: float
-    survival_curve: list[float]   # S(t) for t = 0..horizon
-    horizon_years: int
-    reversal_prob_horizon: float  # 1 - S(horizon)
-    annual_premium_per_tco2e: float
-    insured_tco2e: float          # the tonnage being insured (per yr)
-    annual_premium_value: float   # premium_per_ton x insured tonnage
-    note: str
+class PortfolioSummary:
+    n_fields: int
+    counts: dict                  # verdict status -> count
+    verified_tco2e: float         # credited (VERIFIED + PARTIAL) tonnage / yr
+    verified_at_95_tco2e: float   # tonnage from >=95% confidence fields only
+    fraud_fields: int             # REJECTED claims
+    fraud_exposure_tco2e: float   # claimed-but-unverified tonnage / yr
+    fraud_exposure_value: float   # $ at the given carbon price
+    reversal_fields: int          # fields with a detected reversal
+    reversal_at_risk_tco2e: float # previously-credited tonnage now at risk / yr
+    base_reversal_rate: float     # fraction of ever-verified fields that reverted
+    base_annual_hazard: float     # that rate per observation-year
+    observation_years: float
+    price: float
 
 
-def _stability_multiplier(yearly_effect: list[float]) -> float:
-    """Higher when a credit's additionality is declining or volatile.
+def summarize(reports, price: float = 50.0) -> PortfolioSummary:
+    counts: dict = {}
+    verified = verified95 = 0.0
+    fraud_n = 0
+    fraud_t = 0.0
+    rev_n = 0
+    rev_risk = 0.0
+    ever_verified = 0
+    max_year, min_treat = 2021, 2021
 
-    Transparent triage score in roughly [0.5, 2.5]; not a calibrated parameter.
-    """
-    y = np.asarray([e for e in yearly_effect], dtype=float)
-    if y.size < 2:
-        return 1.0
-    peak = max(float(np.max(y)), 1e-6)
-    last = float(y[-1])
-    decline_frac = float(np.clip((peak - last) / peak, 0.0, 1.0))
-    vol = float(np.clip(np.std(y) / peak, 0.0, 1.0))
-    m = 0.6 + 1.6 * decline_frac + 0.6 * vol
-    return float(np.clip(m, 0.5, 2.5))
+    for r in reports:
+        s = r.verdict.status
+        counts[s] = counts.get(s, 0) + 1
+        c = _safe(r.carbon.central_tco2e_yr)
 
+        if s in ("VERIFIED", "PARTIAL"):
+            verified += c
+            if _safe(r.verdict.confidence) >= 95.0:
+                verified95 += c
 
-def price_report(report, base_annual_hazard: float, price: float = 50.0,
-                 horizon_years: int = 10) -> ReversalRisk:
-    """Price the reversal risk of one audited field."""
-    insured = float(getattr(report.carbon, "central_tco2e_yr", 0.0) or 0.0)
-    verified = report.verdict.status in ("VERIFIED", "PARTIAL")
+        # fraud exposure: a claim was made, nothing detected
+        if s == "REJECTED":
+            fraud_n += 1
+            rate = _safe(r.claimed_rate_tco2e_ha)
+            fraud_t += rate * _safe(r.area_ha)
 
-    rev = getattr(report, "reversal", None)
-    yearly = rev.yearly_effect if rev is not None else []
-    mult = _stability_multiplier(yearly)
+        # reversal exposure
+        rev = getattr(r, "reversal", None)
+        if rev is not None and rev.detected:
+            rev_n += 1
+            # peak credited tonnage that is now at risk
+            peak = max(rev.cumulative_tco2e) if rev.cumulative_tco2e else 0.0
+            rev_risk += _safe(peak)
+        if (s in ("VERIFIED", "PARTIAL")) or (rev is not None and rev.detected):
+            ever_verified += 1
 
-    # a reverted credit is effectively certain to have failed; floor the base
-    # hazard so a portfolio with zero observed reversals still prices *some* risk.
-    base = max(base_annual_hazard, 0.01)
-    hazard = float(np.clip(base * mult, 0.0, 0.6))
-    if rev is not None and rev.detected:
-        hazard = max(hazard, 0.25)   # already reversing -> high hazard
+        # observation window
+        if len(r.month_dates):
+            max_year = max(max_year, int(pd.to_datetime(r.month_dates).year.max()))
 
-    t = np.arange(0, horizon_years + 1)
-    if rev is not None and rev.detected:
-        # Confirmed reversal: the credit is impaired NOW, not a future maybe.
-        # Model it as (near-)terminated rather than smooth exponential survival
-        # (which would absurdly imply an already-collapsed asset still survives).
-        survival = np.where(t == 0, 1.0, 0.05)
-        reversal_note = (" Reversal already detected: credit treated as impaired "
-                         "(survival ~0), not a forward projection.")
-    else:
-        survival = np.exp(-hazard * t)
-        reversal_note = ""
-    prob_h = float(1.0 - survival[-1])
+    obs_years = max(1.0, float(max_year - min_treat + 1))
+    base_rate = (rev_n / ever_verified) if ever_verified else 0.0
+    base_hazard = base_rate / obs_years
 
-    # illustrative annual premium per tonne = price x expected annual loss rate
-    prem_per_ton = float(price * hazard)
-    prem_value = prem_per_ton * insured
-
-    if not verified or insured <= 0:
-        return ReversalRisk(False, mult, hazard, survival.tolist(), horizon_years,
-                            prob_h, 0.0, 0.0, 0.0,
-                            "No verified carbon to insure.")
-
-    note = ("Illustrative. Hazard = portfolio base rate x trajectory-stability "
-            "score; premium = price x annual hazard. Calibrate on real reversal "
-            "history before quoting." + reversal_note)
-    return ReversalRisk(True, mult, hazard, survival.tolist(), horizon_years,
-                        prob_h, prem_per_ton, insured, prem_value, note)
+    return PortfolioSummary(
+        n_fields=len(reports), counts=counts,
+        verified_tco2e=verified, verified_at_95_tco2e=verified95,
+        fraud_fields=fraud_n, fraud_exposure_tco2e=fraud_t,
+        fraud_exposure_value=fraud_t * price,
+        reversal_fields=rev_n, reversal_at_risk_tco2e=rev_risk,
+        base_reversal_rate=base_rate, base_annual_hazard=base_hazard,
+        observation_years=obs_years, price=price,
+    )

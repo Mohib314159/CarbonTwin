@@ -1,27 +1,46 @@
-"""Carbon estimate behaviour."""
-from src.carbon import estimate_carbon, RATE_LOW, RATE_HIGH
+"""Reversal-risk pricing."""
+import numpy as np
+from src.synth_data import generate
+from src.pipeline import run_audit
+from src.portfolio import summarize
+from src.actuary import price_report
 
 
-def test_unverified_is_zero():
-    e = estimate_carbon(0.20, 50.0, verified=False)
-    assert e.central_tco2e_yr == 0.0
+def _by_truth(ds):
+    out = {}
+    for f in ds.fields:
+        out.setdefault(f.truth_label, f.field_id)
+    return out
 
 
-def test_negative_effect_is_zero():
-    e = estimate_carbon(-0.05, 50.0, verified=True)
-    assert e.central_tco2e_yr == 0.0
+def test_survival_is_monotonic_and_bounded():
+    ds = generate(seed=7)
+    bt = _by_truth(ds)
+    reps = [run_audit(ds, f.field_id) for f in ds.fields]
+    ps = summarize(reps)
+    rep = run_audit(ds, bt["adopter"])
+    rr = price_report(rep, ps.base_annual_hazard, price=50.0)
+    s = np.array(rr.survival_curve)
+    assert np.all(np.diff(s) <= 1e-9)            # survival never increases
+    assert 0.0 <= rr.reversal_prob_horizon <= 1.0
+    assert rr.annual_premium_per_tco2e >= 0.0
 
 
-def test_central_within_band_and_monotonic():
-    weak = estimate_carbon(0.05, 50.0, verified=True)
-    strong = estimate_carbon(0.18, 50.0, verified=True)
-    assert strong.central_tco2e_yr > weak.central_tco2e_yr
-    for e in (weak, strong):
-        assert e.low_tco2e_yr <= e.central_tco2e_yr <= e.high_tco2e_yr
-        assert RATE_LOW - 1e-9 <= e.rate_central <= RATE_HIGH + 1e-9
+def test_reverter_prices_higher_than_steady_adopter():
+    ds = generate(seed=7)
+    bt = _by_truth(ds)
+    reps = [run_audit(ds, f.field_id) for f in ds.fields]
+    ps = summarize(reps)
+    adopter = price_report(run_audit(ds, bt["adopter"]), ps.base_annual_hazard)
+    reverter = price_report(run_audit(ds, bt["reverter"]), ps.base_annual_hazard)
+    assert reverter.annual_hazard > adopter.annual_hazard
 
 
-def test_scales_with_area():
-    small = estimate_carbon(0.15, 20.0, verified=True)
-    big = estimate_carbon(0.15, 60.0, verified=True)
-    assert abs(big.central_tco2e_yr - 3 * small.central_tco2e_yr) < 1e-6
+def test_liar_has_no_insurable_carbon():
+    ds = generate(seed=7)
+    bt = _by_truth(ds)
+    reps = [run_audit(ds, f.field_id) for f in ds.fields]
+    ps = summarize(reps)
+    rr = price_report(run_audit(ds, bt["liar"]), ps.base_annual_hazard)
+    assert rr.applicable is False
+    assert rr.annual_premium_value == 0.0

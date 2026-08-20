@@ -1,108 +1,152 @@
 """
-Multi-spectral extraction from the REAL Treefera Sentinel-2 demo cube.
+End-to-end pipeline: Dataset -> per-field audit.
 
-Self-contained: drop this file next to the hackathon notebooks (the folder that
-holds `hackathon_demo_data/`) and run it in the demo env:
+run_audit() is the one call the dashboard and the validation harness both use.
+Everything is built on the data contract, so swapping synthetic data for
+Treefera's real data with live data changes nothing here - only the adapter.
 
-    uv run python run_real_s2.py
-    # or: python run_real_s2.py  /path/to/sentinel2/cube.zarr
-
-It opens the cube, applies the Baseline-04.00 harmonisation (+1000 DN step at
-2022-01-25), masks n_obs==0, and extracts a STACK of physical signals from one
-cube of raw bands:
-
-    NDVI  greenness/biomass   NDRE red-edge stress   NDWI water
-    NDMI  veg moisture (SWIR)  NDTI tillage/residue   BSI bare soil
-
-It saves `s2_multispectral.png`: the index maps for the clearest month + the
-harmonised seasonal time series. This is the "we abuse the whole spectrum, on
-your real data" artefact — every one of these signals feeds the same engine.
+Robustness wired in here (so real data on Thursday doesn't blow up):
+  * thresholds adapt to the dataset's own noise floor (donor placebo pre-RMSE)
+  * a coverage gate refuses to score fields whose off-season window is mostly
+    cloud-interpolated (a clouded-out winter must never read as "no cover crop")
+  * permanence monitoring runs forward in time to flag reversals
 """
-import sys
-from pathlib import Path
+from __future__ import annotations
+
+from dataclasses import dataclass
 
 import numpy as np
-import matplotlib.pyplot as plt
-import xarray as xr
+import pandas as pd
 
-OPTICAL = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12"]
-CUTOVER = np.datetime64("2022-01-25")
+from .audit import EFFECT_MIN, PRE_RMSE_MAX, Verdict, decide
+from .carbon import CarbonEstimate, estimate_carbon
+from .contract import Dataset, monthly_composite, haversine_m, offseason_mask
+from .inference import InferenceResult, placebo_test, benjamini_hochberg
+from .monitor import ReversalResult, detect_onset, detect_reversal
+from .scm import SCMResult, fit
 
-
-def harmonise(cube):
-    times = cube["time"].values.astype("datetime64[D]")
-    post = (times >= CUTOVER)[:, None, None]
-    nodata = cube["n_obs"].values == 0
-    R = {}
-    for b in OPTICAL:
-        if b in cube:
-            dn = cube[b].values.astype("float32")
-            dn = np.where(post, np.clip(dn - 1000.0, 0, None), dn)
-            r = dn / 10000.0
-            r[nodata] = np.nan
-            R[b] = r
-    return R
+COVERAGE_MIN = 0.40          # min fraction of REAL off-season obs to risk a verdict
 
 
-def nd(a, b):
-    d = a + b
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where(d != 0, (a - b) / d, np.nan)
+@dataclass
+class AuditReport:
+    field_id: str
+    month_dates: np.ndarray
+    target: np.ndarray            # composited monthly NDVI of the field
+    scm: SCMResult
+    inference: InferenceResult
+    carbon: CarbonEstimate
+    verdict: Verdict
+    reversal: ReversalResult
+    detected_adoption_year: int | None
+    area_ha: float
+    claimed_rate_tco2e_ha: float | None
+    offseason_coverage: float
+    pre_rmse_max: float
+    truth_label: str | None       # carried through for validation only
 
 
-def stack(cube):
-    R = harmonise(cube); g = R.get
-    s = {"NDVI": nd(g("B08"), g("B04")), "NDRE": nd(g("B08"), g("B05")),
-         "NDWI": nd(g("B03"), g("B08")), "NDMI": nd(g("B08"), g("B11")),
-         "NDTI": nd(g("B11"), g("B12"))}
-    num = (g("B11") + g("B04")) - (g("B08") + g("B02"))
-    den = (g("B11") + g("B04")) + (g("B08") + g("B02"))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        s["BSI"] = np.where(den != 0, num / den, np.nan)
-    return s
+def _pre_mask(month_dates: np.ndarray, treat_year: int) -> np.ndarray:
+    yrs = pd.to_datetime(month_dates).year
+    return yrs < treat_year
 
 
-def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "hackathon_demo_data/sentinel2/cube.zarr"
-    if not Path(path).exists():
-        sys.exit(f"cube not found: {path}\npass the path: python run_real_s2.py <cube.zarr>")
-    cube = xr.open_zarr(path)
-    times = cube["time"].values.astype("datetime64[D]")
-    s = stack(cube)
+def run_audit(dataset: Dataset, target_id: str,
+              treat_year: int | None = None,
+              donor_ids: list[str] | None = None,
+              buffer_m: float | None = None) -> AuditReport:
+    """Audit one field against its claim. Returns everything the UI needs."""
+    month_dates, matrix, observed = monthly_composite(dataset)
+    ids = dataset.ids
+    idx = {fid: i for i, fid in enumerate(ids)}
 
-    # clearest PRE-2022 month for the maps (radiometrically safe stretch)
-    nobs = cube["n_obs"].values
-    clear = nobs.reshape(nobs.shape[0], -1).mean(1)
-    clear = np.where(times < np.datetime64("2022-01-01"), clear, -1)
-    t = int(np.argmax(clear))
-    month = str(times[t])[:7]
+    target = dataset.by_id(target_id)
+    t_idx = idx[target_id]
+    treat_year = treat_year or target.claimed_year or 2021
 
-    maps = ["NDVI", "NDRE", "NDWI", "NDTI"]
-    cmaps = {"NDVI": "RdYlGn", "NDRE": "RdYlGn", "NDWI": "Blues", "NDTI": "YlOrBr"}
-    fig = plt.figure(figsize=(13, 7.5))
-    for i, name in enumerate(maps):
-        ax = fig.add_subplot(2, 4, i + 1)
-        im = ax.imshow(s[name][t], cmap=cmaps[name], vmin=-0.5, vmax=0.9)
-        ax.set_title(f"{name} — {month}", fontsize=11, fontweight="bold")
-        ax.axis("off"); fig.colorbar(im, ax=ax, shrink=0.7)
+    if donor_ids is None:
+        donor_ids = [d for d in dataset.control_ids() if d != target_id]
+    # SUTVA / spatial-spillover guard: optionally exclude donors physically too
+    # close to the treated field (shared runoff / microclimate). Standard applied
+    # fix - a spatial buffer in donor selection, not a penalty inside the solver.
+    # Donors with unknown coordinates are KEPT (can't measure - don't silently drop).
+    if buffer_m:
+        t = dataset.by_id(target_id)
+        kept = []
+        for d in donor_ids:
+            f = dataset.by_id(d)
+            dist = haversine_m(t.lat, t.lon, f.lat, f.lon)
+            if np.isnan(dist) or dist >= buffer_m:
+                kept.append(d)
+        donor_ids = kept
+    donor_rows = np.array([idx[d] for d in donor_ids])
 
-    ax = fig.add_subplot(2, 1, 2)
-    for name in ["NDVI", "NDRE", "NDWI", "NDMI", "NDTI", "BSI"]:
-        series = np.nanmean(s[name].reshape(s[name].shape[0], -1), axis=1)
-        ax.plot(times, series, marker="o", ms=3, lw=1.4, label=name)
-    ax.axvline(CUTOVER, color="0.5", ls="--", lw=1, label="baseline 04.00 (harmonised)")
-    ax.set_title("Six physical signals from one cube — harmonised monthly means (real S2, A_koranga_forks_nz)",
-                 fontsize=12, fontweight="bold")
-    ax.set_ylabel("index value"); ax.grid(alpha=0.3)
-    ax.legend(ncol=7, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12))
-    fig.suptitle("CarbonTwin — multi-spectral extraction from real Treefera Sentinel-2 data",
-                 fontsize=13.5, fontweight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig("s2_multispectral.png", dpi=140, bbox_inches="tight")
-    print(f"selected month: {month}")
-    print(f"extracted signals: {list(s)}")
-    print("wrote s2_multispectral.png")
+    pre = _pre_mask(month_dates, treat_year)
+    post = ~pre
+    os_post = offseason_mask(month_dates, target.lat) & post
+
+    y = matrix[t_idx]
+    D = matrix[donor_rows]
+
+    scm = fit(y, D, pre, donor_ids)
+    inf = placebo_test(y, D, donor_ids, pre)
+
+    # adaptive bad-fit threshold: scale to the dataset's own noise floor, with a
+    # sensible floor so clean data still behaves.
+    pre_rmse_max = max(PRE_RMSE_MAX, 1.6 * inf.median_pre_rmse)
+
+    # coverage of the off-season signal window with REAL (non-interpolated) obs
+    obs_t = observed[t_idx]
+    n_os = int(os_post.sum())
+    coverage = float(np.mean(obs_t[os_post])) if n_os else 0.0
+    coverage_ok = coverage >= COVERAGE_MIN
+
+    eff_os = float(np.mean(scm.effect[os_post])) if os_post.any() else float(np.mean(scm.effect[post]))
+    significant = ((inf.p_value < 0.05) and (eff_os > EFFECT_MIN)
+                   and coverage_ok and (scm.pre_rmse <= pre_rmse_max))
+    carbon = estimate_carbon(eff_os, target.area_ha, verified=significant)
+
+    verdict = decide(
+        field_id=target_id,
+        effect_full=scm.effect,
+        post_mask=post,
+        offseason_post_mask=os_post,
+        p_value=inf.p_value,
+        confidence=inf.confidence,
+        pre_rmse=scm.pre_rmse,
+        claims_adoption=target.claims_adoption,
+        claimed_rate_tco2e_ha=target.claimed_rate_tco2e_ha,
+        est_rate_tco2e_ha=carbon.rate_central,
+        pre_rmse_max=pre_rmse_max,
+        coverage_ok=coverage_ok,
+    )
+
+    reversal = detect_reversal(month_dates, scm.effect, target.area_ha, treat_year, lat=target.lat)
+    detected_year, _, _ = detect_onset(month_dates, scm.effect, lat=target.lat)
+
+    return AuditReport(field_id=target_id, month_dates=month_dates, target=y,
+                       scm=scm, inference=inf, carbon=carbon, verdict=verdict,
+                       reversal=reversal, detected_adoption_year=detected_year,
+                       area_ha=target.area_ha,
+                       claimed_rate_tco2e_ha=target.claimed_rate_tco2e_ha,
+                       offseason_coverage=coverage, pre_rmse_max=pre_rmse_max,
+                       truth_label=target.truth_label)
 
 
-if __name__ == "__main__":
-    main()
+def audit_all_claims(dataset: Dataset) -> list[AuditReport]:
+    """Audit every field that makes a claim (the demo set)."""
+    return [run_audit(dataset, f.field_id)
+            for f in dataset.fields if f.claims_adoption]
+
+
+def fdr_significant(reports, alpha: float = 0.05) -> dict:
+    """Across a batch of audits, return {field_id: bool} for which 'significant'
+    detections survive Benjamini-Hochberg FDR control at level alpha.
+
+    Use this at scale instead of trusting each field's raw p<0.05: it caps the
+    expected proportion of false positives among the fields we flag.
+    """
+    reports = list(reports)
+    pvals = [r.inference.p_value for r in reports]
+    keep = benjamini_hochberg(pvals, alpha)
+    return {r.field_id: bool(k) for r, k in zip(reports, keep)}

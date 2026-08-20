@@ -1,289 +1,31 @@
-"""Assemble a self-contained HTML slide deck (charts embedded as base64).
-
-Design: a financial-grade audit instrument. Cool deep-slate ground; two semantic
-accents that encode the work itself (verify-green, risk-amber); a monospace utility
-face for every datum, label and eyebrow (the audit-terminal voice); and a recurring
-verdict chip as the signature stamp. Restraint everywhere else.
-"""
-import base64, os
-
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+"""Inference: placebo p-value behaviour and Benjamini-Hochberg FDR control."""
+import numpy as np
+from src.inference import benjamini_hochberg
+from src.synth_data import generate
+from src.pipeline import audit_all_claims, fdr_significant
 
 
-def img(name):
-    with open(os.path.join(HERE, "assets", name), "rb") as f:
-        return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+def test_bh_is_never_more_permissive_than_raw():
+    rng = np.random.default_rng(0)
+    p = rng.random(50)
+    assert benjamini_hochberg(p, 0.05).sum() <= (p < 0.05).sum()
 
 
-I = {n: img(n) for n in [
-    "01_verified.png", "02_rejected.png", "05_reversal.png", "06_hazard.png",
-    "07_portfolio.png", "08_aquifer.png", "09_disease.png", "04_map.png",
-    "10_radar.png", "11_intentionality.png"]}
+def test_bh_admits_clearly_significant_when_resolution_is_adequate():
+    p = [0.0004, 0.001, 0.002, 0.003, 0.04, 0.3, 0.7]
+    keep = benjamini_hochberg(p, 0.05)
+    assert keep[:4].all()          # the four tiny p-values survive
+    assert not keep[4:].any()      # the rest do not
 
 
-def chip(text, kind="v"):
-    return f'<span class="chip {kind}"><i></i>{text}</span>'
+def test_bh_empty_and_none_pass():
+    assert benjamini_hochberg([], 0.05).size == 0
+    assert benjamini_hochberg([0.6, 0.7, 0.8], 0.05).sum() == 0
 
 
-SLIDES = f"""
-<section class="slide title">
-  <div class="frame"><span class="ix">CARBONTWIN</span><span class="mk">LCAW 2026 · Challenge B</span></div>
-  <div class="title-body">
-    <div class="eyebrow">Causal MRV · Grinnell, Iowa</div>
-    <h1>Carbon<span class="v">Twin</span></h1>
-    <p class="lead">Auditable causal proof of carbon additionality — from orbit, with a p&#8209;value.</p>
-    <p class="sub">A causal-inference engine that tests whether a regenerative practice
-    truly <em>caused</em> a carbon benefit, flags claims the data can't support, monitors
-    credits for reversal, and prices durability risk — every verdict cross-examinable.</p>
-    <div class="chips">{chip("p = 0.048 · VERIFIED", "v")}{chip("REVERSAL · 2025", "r")}{chip("INCONCLUSIVE · low coverage", "n")}</div>
-  </div>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">01 — THE PROBLEM</span><span class="mk">CARBONTWIN</span></div>
-  <h2>The market's problem isn't scale. It's <span class="v">trust</span>.</h2>
-  <div class="cols">
-    <div>
-      <p>Additionality — <em>would this have happened anyway?</em> — isn't a prediction
-      problem. It's a <b>causal counterfactual</b>: what would this field's carbon have been
-      with no practice? That world is never observed.</p>
-      <p>Machine learning predicts well but is <b>confounded</b> (good farmers adopt on good
-      land) and <b>can't be audited</b> — a chief reason the voluntary ag-carbon market
-      <b>fell ~57% in 2024</b> on quality concerns.</p>
-      <p>Synthetic control is a <b>causal identification method</b>: it builds a defensible
-      counterfactual and returns a p&#8209;value a regulator can cross-examine.</p>
-    </div>
-    <div class="stat">
-      <div class="big">&minus;57%</div><div class="cap">voluntary ag-carbon market, 2024, on trust</div>
-      <div class="big">causal</div><div class="cap">not predictive — the question additionality actually asks</div>
-      <div class="big">p&#8209;value</div><div class="cap">an auditor can interrogate, not a black box</div>
-    </div>
-  </div>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">02 — VERIFY</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Verify the honest farm — and catch the false claim {chip("p = 0.048 · VERIFIED", "v")}</h2>
-  <p class="note">We build a <b>synthetic twin</b> from conventional neighbours, matched to the
-  field's NDVI <em>before</em> 2021. The post-2021 gap is the causal effect. Weather hits the
-  twin too, so it cancels — as do satellite sensor jumps.</p>
-  <div class="imgrow">
-    <figure><img src="{I['01_verified.png']}"><figcaption>Honest adopter — winter green stays
-    elevated while the twin collapses to bare soil. <b class="v">Verified, p = 0.048.</b></figcaption></figure>
-    <figure><img src="{I['02_rejected.png']}"><figcaption>Claimed the same practice, stayed glued
-    to its twin — no causal gap. <b class="r">Rejected — possible false claim.</b></figcaption></figure>
-  </div>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">03 — PERMANENCE</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Catch the reversal in real time {chip("REVERSAL · 2025", "r")}</h2>
-  <p class="note">A credit isn't a one-time stamp — it's a multi-year liability. We keep watching:
-  when a verified credit's additionality collapses (the farmer ploughs it up), we flag it, dated.</p>
-  <figure class="single"><img src="{I['05_reversal.png']}"><figcaption>Credited carbon builds,
-  then the additionality flatlines and the credit is impaired — the durability problem almost
-  nobody monitors.</figcaption></figure>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">04 — PRICE</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Price the risk · roll up the portfolio</h2>
-  <div class="imgrow">
-    <figure><img src="{I['06_hazard.png']}"><figcaption>Reversal hazard as a survival curve: a
-    steady credit holds; a <b class="r">confirmed reversal is treated as impaired</b> (survival → 0),
-    not smoothed away.</figcaption></figure>
-    <figure><img src="{I['07_portfolio.png']}"><figcaption>Verified tonnage, reversal-at-risk, and
-    the value of <b>claimed-but-unverifiable</b> carbon — the fraud exposure on the book.</figcaption></figure>
-  </div>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">05 — DUAL CHANNEL</span><span class="mk">CARBONTWIN</span></div>
-  <h2>The full question: cover crops <em>and</em> no-till {chip("2021 cover · 2023 no-till", "v")}</h2>
-  <p class="note">The farmer made two changes; greenness sees only the first. No-till is the
-  <em>absence of soil disturbance</em> — invisible to optical, visible to radar. The same engine on
-  a radar tillage channel dates the no-till year. (Radar simulated in-harness; real Sentinel-1 swaps in.)</p>
-  <figure class="single"><img src="{I['10_radar.png']}"><figcaption>Optical dates the cover-crop rise
-  (2021); radar dates the no-till fall (2023) — both transitions, one engine.</figcaption></figure>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">06 — INTENTIONALITY</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Greenness, or <span class="v">intention</span>? {chip("texture separates intent", "v")}</h2>
-  <p class="note">Weeds and a planted cover crop are both green in winter — NDVI can't tell them
-  apart. But a drilled crop is spatially <b>uniform</b>; weeds are <b>patchy</b>. At sub-5m,
-  within-field texture separates them: a probabilistic flag, not a perfect classifier.</p>
-  <figure class="single"><img src="{I['11_intentionality.png']}"><figcaption>Same greenness, different
-  texture: cover crops sit below the threshold (uniform), weeds above it (patchy). Detecting
-  <b>management</b>, not just colour.</figcaption></figure>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">07 — DATA</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Six physical signals from one real cube</h2>
-  <p class="note">From a single Sentinel-2 cube of raw bands we extract a stack of physical lenses —
-  harmonised for the 2022 Baseline-04.00 step, nodata masked, never interpolated. Every one feeds
-  the same engine.</p>
-  <div class="stack">
-    <div class="sig"><span class="t">NDVI</span><span class="d">greenness · biomass</span></div>
-    <div class="sig"><span class="t">NDRE</span><span class="d">red-edge chlorophyll · stress, weeks early</span></div>
-    <div class="sig"><span class="t">NDWI</span><span class="d">open water</span></div>
-    <div class="sig"><span class="t">NDMI</span><span class="d">vegetation moisture · SWIR</span></div>
-    <div class="sig"><span class="t">NDTI</span><span class="d">tillage · crop residue · SWIR</span></div>
-    <div class="sig"><span class="t">BSI</span><span class="d">bare-soil exposure</span></div>
-  </div>
-  <p class="small">One cube &rarr; six signals &rarr; one causal engine. The engine never knew what
-  NDVI meant — it reads arrays, so any extractable signal plugs in unchanged.</p>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">08 — GENERALISE</span><span class="mk">CARBONTWIN</span></div>
-  <h2>One engine, any natural experiment</h2>
-  <p class="note">The identical synthetic-control + placebo engine, with a thin wrapper, reads three
-  different crises — evidence it's a general causal tool, not a one-trick detector.</p>
-  <div class="imgrow">
-    <figure><img src="{I['08_aquifer.png']}"><figcaption>Saudi pivot circle collapsing to desert as
-    the aquifer depletes — abandonment dated automatically.</figcaption></figure>
-    <figure><img src="{I['09_disease.png']}"><figcaption>Crop disease flagged in red-edge
-    <b>2–3 weeks before</b> it surfaces in NDVI.</figcaption></figure>
-  </div>
-</section>
-
-<section class="slide">
-  <div class="frame"><span class="ix">09 — POSITIONING</span><span class="mk">CARBONTWIN</span></div>
-  <h2>What we add to Treefera — and what we didn't fake</h2>
-  <div class="cols">
-    <div>
-      <p>Treefera is the standard for <b>ML-driven environmental data at scale</b>. The gap isn't
-      scale — it's <b>regulatory auditability</b>: a black-box baseline can't defend itself when a
-      buyer queries an additionality claim.</p>
-      <p>CarbonTwin shows how to deliver a <b>transparent, econometric, auditable p&#8209;value for
-      every asset</b> — with a fraud check, a permanence monitor, and a reversal price. It sits
-      <em>on top of</em> their models, not against them.</p>
-      <p class="small">Built honestly: no hallucinated counterfactual imagery, no real-radar claim we
-      can't back, no "autonomous agent that liquidates farmers." We price risk; humans decide.
-      Validated on planted ground truth — <b>zero false credits, 45 passing tests.</b></p>
-    </div>
-    <figure class="mapfig"><img src="{I['04_map.png']}"><figcaption>Colour the region; send inspectors
-    only to the red.</figcaption></figure>
-  </div>
-  <p class="close">CarbonTwin — proof, not promises.</p>
-</section>
-
-<section class="slide appendix">
-  <div class="frame"><span class="ix">APPENDIX — Q&amp;A</span><span class="mk">CARBONTWIN</span></div>
-  <h2>Anticipated questions</h2>
-  <div class="qa">
-    <div><b>NDVI isn't carbon.</b> Correct — we prove additionality statistically; tonnage is a literature band (~1.3 t/ha/yr), not a measured figure. Soil cores calibrate it.</div>
-    <div><b>Did you overfit synthetic data?</b> It's a stress-test with planted ground truth; fields are generated independently, so recovery isn't circular.</div>
-    <div><b>Could weeds fake a cover crop?</b> In mean NDVI, yes — which is why within-field texture (sub-5m) separates uniform crops from patchy weeds, as a probabilistic flag.</div>
-    <div><b>What about the 2023 no-till?</b> A radar tillage channel detects soil disturbance; the dual-channel engine dates both transitions.</div>
-    <div><b>Small donor pool?</b> Permutation p floors at 1/(donors+1); &lt;19 &rarr; INCONCLUSIVE, never a false accusation. County pools resolve finely.</div>
-    <div><b>Spatial spillover (SUTVA)?</b> An optional donor buffer excludes too-close neighbours; the convex solver runs unchanged.</div>
-    <div><b>False positives at scale?</b> Benjamini-Hochberg FDR across the batch; INCONCLUSIVE protects honest-but-weak fields meanwhile.</div>
-    <div><b>Why not ML?</b> ML predicts; additionality is a causal counterfactual, and a black box can't be cross-examined. We sit on top of ML.</div>
-    <div><b>Southern Hemisphere?</b> The seasonal window is latitude-aware — it flips below the equator.</div>
-    <div><b>Creative use of the data?</b> Six physical signals from one Sentinel-2 cube, harmonised for the 2022 baseline step — each feeding the same engine.</div>
-  </div>
-</section>
-"""
-
-HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CarbonTwin</title>
-<style>
-:root{
-  --ink:#0A0E13; --panel:#10161F; --paper:#E9EDF1; --mute:#7C8898;
-  --line:#1B2531; --verify:#46C58C; --risk:#E2A35C;
-  --mono:"SF Mono","JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
-  --sans:-apple-system,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
-}
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{background:var(--ink);color:var(--paper);font-family:var(--sans);
-  scroll-snap-type:y mandatory;overflow-y:scroll;scroll-behavior:smooth;
-  background-image:radial-gradient(60% 50% at 78% 0%,rgba(70,197,140,.05),transparent 70%);}
-.v{color:var(--verify)} .r{color:var(--risk)}
-.slide{min-height:100vh;scroll-snap-align:start;display:flex;flex-direction:column;
-  justify-content:center;padding:9vh 7vw 7vh;position:relative;border-bottom:1px solid var(--line)}
-/* report-header frame */
-.frame{position:absolute;top:0;left:0;right:0;display:flex;justify-content:space-between;
-  align-items:center;padding:18px 7vw;font-family:var(--mono);font-size:12px;letter-spacing:.14em;
-  color:var(--mute);border-bottom:1px solid var(--line)}
-.frame .mk{opacity:.7}
-.eyebrow{font-family:var(--mono);font-size:13px;letter-spacing:.18em;text-transform:uppercase;
-  color:var(--mute);margin-bottom:22px}
-h1{font-size:clamp(54px,10vw,140px);font-weight:800;letter-spacing:-.035em;line-height:.92}
-h2{font-size:clamp(27px,4vw,50px);font-weight:780;letter-spacing:-.02em;margin-bottom:22px;
-  line-height:1.06;display:flex;flex-wrap:wrap;align-items:center;gap:16px}
-.lead{font-size:clamp(20px,2.7vw,33px);color:#fff;margin:24px 0 16px;font-weight:600;max-width:24ch;line-height:1.15}
-.sub{font-size:clamp(15px,1.45vw,19px);color:var(--mute);max-width:62ch;line-height:1.55}
-p{font-size:clamp(15px,1.4vw,18px);line-height:1.6;color:#C4CAD3;margin-bottom:14px;max-width:64ch}
-.note{color:var(--mute);margin-bottom:22px;max-width:92ch}
-b{color:#fff;font-weight:680} b.v{color:var(--verify)} b.r{color:var(--risk)}
-em{color:var(--paper);font-style:italic}
-.cols{display:grid;grid-template-columns:1.3fr .9fr;gap:52px;align-items:center}
-.stat{border-left:1px solid var(--line);padding-left:30px}
-.stat .big{font-family:var(--mono);font-size:clamp(34px,4.6vw,60px);font-weight:600;color:var(--verify);
-  line-height:1;letter-spacing:-.02em}
-.stat .cap{color:var(--mute);font-size:14px;margin:8px 0 28px;max-width:30ch}
-.imgrow{display:grid;grid-template-columns:1fr 1fr;gap:30px;align-items:start}
-figure{margin:0}
-figure img{width:100%;border-radius:10px;border:1px solid var(--line);background:var(--panel);
-  display:block;box-shadow:0 18px 40px rgba(0,0,0,.35)}
-figcaption{color:var(--mute);font-size:13.5px;margin-top:13px;line-height:1.5;max-width:54ch}
-.single{display:flex;flex-direction:column;align-items:center;text-align:center}
-.single img{max-height:62vh;width:auto} .single figcaption{text-align:center;max-width:76ch}
-.mapfig img{max-height:50vh;width:auto}
-.small{font-size:14px;color:var(--mute)}
-/* verdict chip — the signature */
-.chip{display:inline-flex;align-items:center;gap:9px;font-family:var(--mono);font-size:13px;
-  letter-spacing:.06em;padding:7px 13px;border-radius:999px;border:1px solid var(--line);
-  background:var(--panel);color:var(--paper);white-space:nowrap;vertical-align:middle}
-.chip i{width:7px;height:7px;border-radius:50%;display:inline-block}
-.chip.v{border-color:rgba(70,197,140,.4)} .chip.v i{background:var(--verify);box-shadow:0 0 9px var(--verify)}
-.chip.r{border-color:rgba(226,163,92,.4)} .chip.r i{background:var(--risk);box-shadow:0 0 9px var(--risk)}
-.chip.n i{background:var(--mute)}
-h2 .chip{font-size:12px}
-.chips{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px}
-/* signal stack (data slide) */
-.stack{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:6px 0 22px;max-width:980px}
-.sig{border:1px solid var(--line);border-left:2px solid var(--verify);border-radius:8px;
-  padding:16px 18px;background:var(--panel)}
-.sig .t{font-family:var(--mono);font-size:18px;font-weight:600;color:#fff;display:block}
-.sig .d{color:var(--mute);font-size:13.5px;margin-top:5px;display:block;line-height:1.4}
-.close{position:absolute;bottom:5vh;left:7vw;color:var(--verify);font-family:var(--mono);
-  font-weight:600;font-size:18px;letter-spacing:.02em}
-.appendix{background:#080B0F}
-.appendix .sig{border-left-color:var(--mute)}
-.qa{display:grid;grid-template-columns:1fr 1fr;gap:15px 40px;margin-top:6px}
-.qa div{font-size:clamp(13px,1.2vw,15.5px);color:#C4CAD3;line-height:1.45;max-width:50ch}
-.qa b{display:block;margin-bottom:2px}
-.counter{position:fixed;bottom:16px;right:20px;color:#4A5666;font-family:var(--mono);font-size:12px;z-index:10}
-.hint{position:fixed;bottom:16px;left:20px;color:#4A5666;font-family:var(--mono);font-size:12px;z-index:10;letter-spacing:.08em}
-/* enter animation */
-.slide>*:not(.frame){opacity:0;transform:translateY(14px);transition:opacity .6s ease,transform .6s ease}
-.slide.on>*:not(.frame){opacity:1;transform:none}
-.title-body{display:contents}
-@media(prefers-reduced-motion:reduce){.slide>*:not(.frame){opacity:1;transform:none;transition:none}}
-@media(max-width:860px){.cols,.imgrow,.stack{grid-template-columns:1fr;gap:22px}.qa{grid-template-columns:1fr}
-  .frame{padding:14px 7vw}.slide{padding:11vh 7vw 7vh}}
-</style></head><body>
-__SLIDES__
-<div class="counter" id="c"></div><div class="hint">&uarr; &darr; / space &middot; to navigate</div>
-<script>
-const s=[...document.querySelectorAll('.slide')];let i=0;
-const c=document.getElementById('c');const upd=()=>c.textContent=(i+1)+' / '+s.length;
-const go=n=>{i=Math.max(0,Math.min(s.length-1,n));s[i].scrollIntoView();upd();};
-addEventListener('keydown',e=>{
- if(['ArrowDown','PageDown',' '].includes(e.key)){e.preventDefault();go(i+1);}
- if(['ArrowUp','PageUp'].includes(e.key)){e.preventDefault();go(i-1);}
- if(e.key==='Home')go(0); if(e.key==='End')go(s.length-1);});
-const ob=new IntersectionObserver(es=>es.forEach(en=>{
-  if(en.isIntersecting){en.target.classList.add('on');i=s.indexOf(en.target);upd();}}),{threshold:.45});
-s.forEach(x=>ob.observe(x));s[0].classList.add('on');upd();
-</script></body></html>"""
-
-out = os.path.join("/mnt/user-data/outputs", "CarbonTwin_deck.html")
-open(out, "w").write(HTML.replace("__SLIDES__", SLIDES))
-print("wrote", out, "(", round(os.path.getsize(out) / 1024), "KB )")
+def test_fdr_helper_runs_on_real_batch():
+    ds = generate(seed=7)
+    reports = audit_all_claims(ds)
+    flags = fdr_significant(reports, 0.05)
+    assert set(flags.keys()) == {r.field_id for r in reports}
+    assert all(isinstance(v, bool) for v in flags.values())

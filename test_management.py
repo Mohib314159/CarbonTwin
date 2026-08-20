@@ -1,57 +1,80 @@
-"""Sub-5m extractors: texture separates uniform parcels from patchy; all signals run."""
+"""Multi-spectral extraction on a synthetic cube matching the Treefera S2 format.
+
+Validates: Baseline-04.00 harmonisation removes the +1000 step; the index stack
+computes sensible values; from_s2_zarr tiles a cube into auditable parcels.
+"""
 import numpy as np
 import pytest
 
 xr = pytest.importorskip("xarray")
 
 
-def _cube(path, ny=60, nx=60, T=24):
-    """Left third = UNIFORM high NDVI (managed); middle = PATCHY (weeds); right = bare."""
-    rng = np.random.default_rng(2)
+def _make_cube(path, ny=60, nx=60, T=24):
+    """Synthetic S2 cube: uint16 bands, n_obs, monthly, +1000 step at 2022-01-25."""
+    rng = np.random.default_rng(0)
     times = np.array([np.datetime64("2021-01") + np.timedelta64(m, "M") for m in range(T)]
                      ).astype("datetime64[ns]")
-    uni = np.zeros((ny, nx), bool); uni[:, : nx // 3] = True
-    patch = np.zeros((ny, nx), bool); patch[:, nx // 3: 2 * nx // 3] = True
-    bare = ~(uni | patch)
+    post = (times.astype("datetime64[D]") >= np.datetime64("2022-01-25"))
 
-    def band(bu, bp, bb, patch_noise):
+    # three land types across the scene: vegetation / water / bare soil
+    veg = np.zeros((ny, nx), bool); veg[:, : nx // 3] = True
+    water = np.zeros((ny, nx), bool); water[:, nx // 3: 2 * nx // 3] = True
+    bare = ~(veg | water)
+
+    def band(base_veg, base_water, base_bare, season=0.0):
         b = np.zeros((T, ny, nx), np.float32)
         for t in range(T):
-            b[t][uni] = bu
-            b[t][patch] = bp
-            b[t][bare] = bb
-        b[:, patch] += rng.normal(0, patch_noise, b[:, patch].shape)   # patchy = noisy
-        b += rng.normal(0, 25, b.shape)
+            s = 1.0 + season * np.sin(2 * np.pi * (t % 12) / 12.0)
+            b[t][veg] = base_veg * s
+            b[t][water] = base_water
+            b[t][bare] = base_bare
+        b += rng.normal(0, 40, b.shape)
+        b[post] += 1000.0                       # the artefact we must remove
         return np.clip(b, 0, 12000).astype("uint16")
 
-    data = dict(B02=band(400, 420, 1500, 200), B03=band(700, 720, 1800, 200),
-                B04=band(600, 1500, 2200, 600), B05=band(1400, 1500, 2300, 300),
-                B06=band(2600, 2400, 2400, 300), B07=band(3000, 2800, 2450, 300),
-                B08=band(3800, 3000, 2600, 900), B8A=band(3900, 3000, 2600, 900),
-                B11=band(2000, 2100, 3200, 300), B12=band(1500, 1600, 3000, 300))
+    data = dict(
+        B02=band(400, 600, 1500), B03=band(700, 900, 1800), B04=band(600, 500, 2200, 0.2),
+        B05=band(1400, 450, 2300), B06=band(2600, 430, 2400), B07=band(3000, 420, 2450),
+        B08=band(3800, 300, 2600, 0.3), B8A=band(3900, 300, 2600),
+        B11=band(2000, 200, 3200), B12=band(1500, 180, 3000),
+    )
     nobs = np.full((T, ny, nx), 5, np.uint8)
-    xr.Dataset({k: (("time", "y", "x"), v) for k, v in data.items()}
-               | {"n_obs": (("time", "y", "x"), nobs)},
-               coords=dict(time=times, y=np.arange(ny) * 10.0, x=np.arange(nx) * 10.0)
-               ).to_zarr(path, mode="w")
+    nobs[rng.random((T, ny, nx)) < 0.1] = 0      # scattered nodata
+    ds = xr.Dataset({k: (("time", "y", "x"), v) for k, v in data.items()}
+                    | {"n_obs": (("time", "y", "x"), nobs)},
+                    coords=dict(time=times, y=np.arange(ny) * 10.0, x=np.arange(nx) * 10.0))
+    ds.to_zarr(path, mode="w")
+    return veg
 
 
-def test_texture_separates_uniform_from_patchy(tmp_path):
-    from src.field_signals import signal_dataset
-    p = str(tmp_path / "c.zarr"); _cube(p)
-    ds = signal_dataset(p, signal="texture_std", tile=20)
-    # parcels in the left third (uniform) should have lower texture than the middle (patchy)
-    left = [np.nanmean(f.ndvi) for f in ds.fields if f.lon < 200]
-    mid = [np.nanmean(f.ndvi) for f in ds.fields if 200 <= f.lon < 400]
-    assert np.nanmean(mid) > np.nanmean(left)
+def test_harmonisation_removes_baseline_step(tmp_path):
+    from src.spectral import index_stack
+    p = str(tmp_path / "cube.zarr")
+    veg = _make_cube(p)
+    cube = xr.open_zarr(p)
+    ndvi = index_stack(cube)["NDVI"]              # (T, y, x), harmonised
+    veg_ndvi = np.nanmean(ndvi.reshape(ndvi.shape[0], -1)[:, veg.reshape(-1)], axis=1)
+    pre, post = veg_ndvi[:12], veg_ndvi[12:]
+    # without harmonisation the post step would crater NDVI; check it stays close
+    assert abs(np.nanmean(post) - np.nanmean(pre)) < 0.06
+    assert np.nanmean(veg_ndvi) > 0.4            # vegetation reads green
 
 
-def test_all_signals_build_auditable_datasets(tmp_path):
-    from src.field_signals import signal_dataset
-    from src.contract import monthly_composite
-    p = str(tmp_path / "c.zarr"); _cube(p)
-    for sig in ("texture_std", "texture_contrast", "albedo", "perimeter_ratio"):
-        ds = signal_dataset(p, signal=sig, tile=20)
-        assert len(ds.fields) >= 4
-        _, matrix, _ = monthly_composite(ds)
-        assert matrix.shape[0] == len(ds.fields)
+def test_index_stack_has_all_signals_in_range(tmp_path):
+    from src.spectral import index_stack
+    p = str(tmp_path / "cube.zarr"); _make_cube(p)
+    stack = index_stack(xr.open_zarr(p))
+    for name in ("NDVI", "NDRE", "NDWI", "NDMI", "NDTI", "BSI", "EVI"):
+        assert name in stack
+        vals = stack[name][np.isfinite(stack[name])]
+        assert vals.min() >= -1.5 and vals.max() <= 1.5
+
+
+def test_from_s2_zarr_tiles_into_auditable_parcels(tmp_path):
+    from src.adapter import from_s2_zarr
+    from src.contract import Dataset, monthly_composite
+    p = str(tmp_path / "cube.zarr"); _make_cube(p)
+    ds = from_s2_zarr(p, index="NDVI", tile=20)
+    assert isinstance(ds, Dataset) and len(ds.fields) >= 4
+    md, matrix, observed = monthly_composite(ds)        # builds a usable panel
+    assert matrix.shape[0] == len(ds.fields)

@@ -1,46 +1,53 @@
-"""Reversal-risk pricing."""
+"""Verdict logic — every state, including the honest INCONCLUSIVE."""
 import numpy as np
-from src.synth_data import generate
-from src.pipeline import run_audit
-from src.portfolio import summarize
-from src.actuary import price_report
+from src.audit import decide
+
+# helper: build masks/effect for a post-only off-season effect value
+def _mk(effect_value, pre_rmse=0.02):
+    T = 24
+    post = np.zeros(T, bool); post[12:] = True
+    os_post = np.zeros(T, bool); os_post[12:] = True
+    eff = np.zeros(T); eff[os_post] = effect_value
+    return eff, post, os_post, pre_rmse
 
 
-def _by_truth(ds):
-    out = {}
-    for f in ds.fields:
-        out.setdefault(f.truth_label, f.field_id)
-    return out
+def test_flat_claim_is_rejected():
+    eff, post, osp, r = _mk(0.0)
+    v = decide("F", eff, post, osp, p_value=0.6, confidence=40, pre_rmse=r,
+               claims_adoption=True)
+    assert v.status == "REJECTED"
 
 
-def test_survival_is_monotonic_and_bounded():
-    ds = generate(seed=7)
-    bt = _by_truth(ds)
-    reps = [run_audit(ds, f.field_id) for f in ds.fields]
-    ps = summarize(reps)
-    rep = run_audit(ds, bt["adopter"])
-    rr = price_report(rep, ps.base_annual_hazard, price=50.0)
-    s = np.array(rr.survival_curve)
-    assert np.all(np.diff(s) <= 1e-9)            # survival never increases
-    assert 0.0 <= rr.reversal_prob_horizon <= 1.0
-    assert rr.annual_premium_per_tco2e >= 0.0
+def test_strong_significant_is_verified():
+    eff, post, osp, r = _mk(0.15)
+    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=r,
+               claims_adoption=True)
+    assert v.status == "VERIFIED"
 
 
-def test_reverter_prices_higher_than_steady_adopter():
-    ds = generate(seed=7)
-    bt = _by_truth(ds)
-    reps = [run_audit(ds, f.field_id) for f in ds.fields]
-    ps = summarize(reps)
-    adopter = price_report(run_audit(ds, bt["adopter"]), ps.base_annual_hazard)
-    reverter = price_report(run_audit(ds, bt["reverter"]), ps.base_annual_hazard)
-    assert reverter.annual_hazard > adopter.annual_hazard
+def test_significant_below_claim_is_partial():
+    eff, post, osp, r = _mk(0.10)
+    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=r,
+               claims_adoption=True, claimed_rate_tco2e_ha=3.0, est_rate_tco2e_ha=0.5)
+    assert v.status == "PARTIAL"
 
 
-def test_liar_has_no_insurable_carbon():
-    ds = generate(seed=7)
-    bt = _by_truth(ds)
-    reps = [run_audit(ds, f.field_id) for f in ds.fields]
-    ps = summarize(reps)
-    rr = price_report(run_audit(ds, bt["liar"]), ps.base_annual_hazard)
-    assert rr.applicable is False
-    assert rr.annual_premium_value == 0.0
+def test_signal_but_not_significant_is_inconclusive():
+    eff, post, osp, r = _mk(0.06)
+    v = decide("F", eff, post, osp, p_value=0.12, confidence=88, pre_rmse=r,
+               claims_adoption=True)
+    assert v.status == "INCONCLUSIVE"
+
+
+def test_bad_prefit_is_inconclusive():
+    eff, post, osp, _ = _mk(0.15, pre_rmse=0.09)
+    v = decide("F", eff, post, osp, p_value=0.02, confidence=98, pre_rmse=0.09,
+               claims_adoption=True)
+    assert v.status == "INCONCLUSIVE"
+
+
+def test_flat_no_claim_is_baseline():
+    eff, post, osp, r = _mk(0.0)
+    v = decide("F", eff, post, osp, p_value=0.6, confidence=40, pre_rmse=r,
+               claims_adoption=False)
+    assert v.status == "BASELINE"
